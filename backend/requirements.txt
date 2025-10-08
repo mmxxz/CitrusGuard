@@ -1,0 +1,24 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+# Use psycopg v3 binary to avoid system libpq issues
+psycopg[binary]
+pydantic[email]
+pydantic-settings
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+
+# Pin LangChain stack to versions compatible with Pydantic v2
+langchain>=0.3.7
+langchain-openai>=0.2.7
+langchain-community>=0.3.7
+langgraph>=0.2.39
+langchain-postgres>=0.0.12
+
+pgvector
+sentence-transformers
+httpx
+requests
+numpy
