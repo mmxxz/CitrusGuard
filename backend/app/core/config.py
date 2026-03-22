@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     DIAGNOSIS_AGENT_BACKEND: str = "agent_v2"
 
     # 向量嵌入：Hugging Face 模型 ID，或本机目录绝对/相对路径（见 .env 示例）
-    EMBEDDING_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    EMBEDDING_MODEL_NAME: str = "/Users/letaotao/Desktop/CitrusGuard/backend/models/paraphrase-multilingual-MiniLM-L12-v2"
 
     # OpenWeatherMap API Key
     OPENWEATHER_API_KEY: str = "your_openweather_api_key_here"

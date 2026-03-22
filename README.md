@@ -21,49 +21,49 @@
 CitrusGuard 的核心是基于 `LangChain` 构建的 **AI Agent**。它并非一个简单的问答机器人，而是由一个**精心设计的系统提示词 (System Prompt)** 驱动的智能执行体。这个提示词中定义了三大核心工作流（**诊断、预测、维护**），指导 Agent 如何根据用户意图，按预设逻辑顺序调用一系列“专家工具”来解决复杂问题。
 
 ```mermaid
-graph TD
-    subgraph "用户端 (User Client)"
-        User[<fa:fa-user> 用户]
+flowchart TD
+    subgraph UC["用户端 User Client"]
+        User[用户]
     end
 
-    subgraph "前端 (Frontend)"
-        WebApp[<font size=4>React SPA (Vite)</font><br/>用户界面<br/>状态管理]
+    subgraph FE["前端 Frontend"]
+        WebApp["React SPA Vite 用户界面与状态管理"]
     end
 
-    subgraph "后端 (Backend - FastAPI)"
-        APIGateway[<font size=4>API 层</font><br/>(REST Endpoints)]
-        ServiceLayer[<b>服务层</b><br/>核心业务逻辑]
-        Agent[<font size=4 color=red>🤖 AI Agent (LangChain)</font><br/>诊断/预测/维护工作流]
-        Tools[Agent Tools<br/>(视觉/知识库/数据库)]
-        CRUDLayer[<b>数据访问层</b><br/>(SQLAlchemy CRUD)]
+    subgraph BE["后端 Backend FastAPI"]
+        APIGateway["API 层 REST"]
+        ServiceLayer["服务层 核心业务"]
+        Agent["AI Agent LangChain 诊断预测维护"]
+        Tools["Agent Tools 视觉知识库数据库"]
+        CRUDLayer["数据访问层 SQLAlchemy CRUD"]
     end
 
-    subgraph "数据与模型 (Data & Models)"
-        Database[(<fa:fa-database> PostgreSQL DB)]
-        FileStorage[<fa:fa-folder-open> 文件存储<br/>(上传的图片)]
-        MLModel[<fa:fa-brain> AI 模型<br/>(Sentence Transformer)]
+    subgraph DM["数据与模型 Data and Models"]
+        Database[("PostgreSQL")]
+        FileStorage["文件存储 上传图片"]
+        MLModel["嵌入与视觉模型"]
     end
 
-    User -- "1. 浏览器访问" --> WebApp
-    WebApp -- "2. 发起 API 请求 (HTTP/S)" --> APIGateway
-    APIGateway -- "3. 路由到服务" --> ServiceLayer
-    ServiceLayer -- "4. 调用 AI Agent (执行诊断)" --> Agent
-    ServiceLayer -- "5. 直接操作数据 (如用户管理)" --> CRUDLayer
-    Agent -- "6. 使用工具与系统交互" --> Tools
-    Tools -- "7. 通过 CRUD 获取数据" --> CRUDLayer
-    Agent -- "8. 调用模型进行语义理解" --> MLModel
-    CRUDLayer -- "9. 读/写数据" --> Database
-    APIGateway -- "处理文件上传" --> FileStorage
+    User -->|1 浏览器访问| WebApp
+    WebApp -->|2 API 请求 HTTPS| APIGateway
+    APIGateway -->|3 路由到服务| ServiceLayer
+    ServiceLayer -->|4 调用 Agent 诊断等| Agent
+    ServiceLayer -->|5 直接 CRUD| CRUDLayer
+    Agent -->|6 使用工具| Tools
+    Tools -->|7 经 CRUD 取数| CRUDLayer
+    Agent -->|8 语义与向量| MLModel
+    CRUDLayer -->|9 读写| Database
+    APIGateway -->|文件上传| FileStorage
 
-    classDef frontend fill:#e0f7fa,stroke:#00796b,stroke-width:2px;
-    classDef backend fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
-    classDef data fill:#f1f8e9,stroke:#558b2f,stroke-width:2px;
-    classDef user fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+    classDef frontend fill:#e0f7fa,stroke:#00796b
+    classDef backend fill:#fff3e0,stroke:#f57c00
+    classDef data fill:#f1f8e9,stroke:#558b2f
+    classDef userclient fill:#fce4ec,stroke:#c2185b
 
-    class User user;
-    class WebApp frontend;
-    class APIGateway,ServiceLayer,Agent,Tools,CRUDLayer backend;
-    class Database,FileStorage,MLModel data;
+    class User userclient
+    class WebApp frontend
+    class APIGateway,ServiceLayer,Agent,Tools,CRUDLayer backend
+    class Database,FileStorage,MLModel data
 ```
 
 ### 核心功能
