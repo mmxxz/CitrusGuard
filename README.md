@@ -114,6 +114,86 @@ flowchart TD
      - ![风险预警](screen/风险预警看板.png)
 
 
+### 📖 使用说明
+
+#### 环境要求
+
+* **Python** 3.11 及以上  
+* **Node.js** 18 及以上（前端）  
+* **Docker**（推荐）：用于启动带 **pgvector** 的 PostgreSQL  
+* **Git LFS**：若仓库包含大体积权重（如 `backend/models/convnext/best.pt`），克隆前请执行 `git lfs install`  
+
+#### 1. 获取代码
+
+```bash
+git lfs install   # 若使用 LFS 跟踪的权重文件
+git clone https://github.com/mmxxz/CitrusGuard.git
+cd CitrusGuard
+```
+
+#### 2. 启动数据库
+
+在仓库根目录执行（与 `docker-compose.yml` 中账号库名一致）：
+
+```bash
+docker compose up -d
+```
+
+默认连接串为：`postgresql://user:password@localhost:5432/citrusguard`，需与 `backend/.env` 里 `DATABASE_URL` 一致。
+
+#### 3. 配置并启动后端
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env               # 再编辑 .env 填入密钥与数据库地址
+alembic upgrade head
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+说明：
+
+* 请在 **`backend` 目录下** 运行 `uvicorn`，以便上传目录、静态资源等相对路径正确。  
+* 在 `.env` 中至少配置实际使用的 **大模型 API**（如 `OPENROUTER_API_KEY` 或 `DEEPSEEK_API_KEY` 等，与当前路由/服务商一致即可）。  
+* **向量嵌入**：默认可在 `.env` 中设置 `EMBEDDING_MODEL_NAME`；不设置时可用 Hugging Face 模型 ID（首次运行会下载权重，需能访问外网），或改为本机模型目录的绝对路径。  
+* **本地 CitrusHVT 图像推理**：将 `best.pt` 置于 `backend/models/convnext/`，并自行安装 **PyTorch**、**timm** 等（`requirements.txt` 未强制包含时按环境补齐）。未安装或缺少权重时，系统会按代码逻辑降级（例如走多模态 LLM）。  
+* 天气类能力需配置 `OPENWEATHER_API_KEY`。  
+* 诊断后端可在 `.env` 中设置 `DIAGNOSIS_AGENT_BACKEND`：`agent_v2`（默认）或 `langgraph`。
+
+自检：
+
+* 接口根路径：<http://127.0.0.1:8000/>  
+* OpenAPI 文档：<http://127.0.0.1:8000/docs>  
+
+#### 4. 启动前端
+
+```bash
+cd project
+npm install
+npm run dev
+```
+
+默认通过环境变量 **`VITE_API_BASE_URL`** 指向后端（未设置时为 `http://127.0.0.1:8000`）。若后端地址或端口不同，可在 `project` 下新建 `.env.local`：
+
+```bash
+VITE_API_BASE_URL=http://127.0.0.1:8000
+```
+
+浏览器访问：<http://localhost:5173>（与后端 CORS 中允许的本地开发源一致）。
+
+#### 5. 生产构建（可选）
+
+```bash
+cd project
+npm run build
+npm run preview    # 本地预览构建结果，注意配置好正式环境的 API 地址与 CORS
+```
+
+后端 CORS 当前默认允许 `localhost:5173`；若部署域名或端口变化，请在 `backend/app/main.py` 的 `origins` 中补充。
+
+
 ### 🚀 技术栈
 
 *   **后端**:
