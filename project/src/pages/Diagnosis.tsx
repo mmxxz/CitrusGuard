@@ -11,6 +11,7 @@ import ClarificationCard from '../components/ClarificationCard';
 import ResultCard from '../components/ResultCard';
 import FarmOperationForm from '../components/FarmOperationForm';
 import { wsClient } from '../services/ws';
+import { riskAlertDisplayName } from '../lib/riskAlert';
 
 Modal.setAppElement('#root');
 
@@ -120,11 +121,14 @@ const Diagnosis = () => {
   }, [orchard, sessionId]);
 
   useEffect(() => {
-    if (alertToConfirm) {
-      handleSendMessage(`我来确认一下 ${alertToConfirm.risk_item} 的风险。`);
-      // 清空路由状态，避免返回本页时再次自动触发
-      navigate(location.pathname, { replace: true, state: {} });
-    }
+    if (!alertToConfirm) return;
+    const label = riskAlertDisplayName(alertToConfirm);
+    void handleSendMessage(
+      `我在风险预警里看到「${label}」的中/高风险提示，想结合果园实际情况再确认一下风险，并看是否需要拍照诊断。`
+    );
+    // 清空路由状态，避免返回本页时再次自动触发
+    navigate(location.pathname, { replace: true, state: {} });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在进入页时根据路由 state 触发一次
   }, [alertToConfirm]);
 
   const fetchResult = async () => {

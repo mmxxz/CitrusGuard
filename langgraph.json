@@ -1,0 +1,8 @@
+{
+  "dependencies": [
+    "./backend"
+  ],
+  "graphs": {
+    "app": "./backend/app/agents/graph/graph.py:app"
+  }
+}

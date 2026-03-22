@@ -1,14 +1,122 @@
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import asyncio
 import json
 import requests
 import numpy as np
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from app.services.agent_callbacks import WebSocketCallbackHandler
-from langchain import hub
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain.memory import ConversationBufferMemory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage as _HumanMsg, AIMessage as _AIMsg
+
+# ── Agent & Memory —— 兼容 langchain 0.3.x 和 langchain 1.x ─────────────────
+# langchain 1.2+ 全面重构，删除了 create_tool_calling_agent / AgentExecutor /
+# ConversationBufferMemory，改用 LangGraph 原生接口。
+# 此处先尝试加载旧版 API，失败时回退到 langgraph.prebuilt 实现相同功能。
+
+try:
+    from langchain.agents import create_tool_calling_agent, AgentExecutor  # 0.3.x
+    try:
+        from langchain.memory import ConversationBufferMemory  # 0.3.x
+    except ImportError:
+        from langchain_community.memory import ConversationBufferMemory  # type: ignore
+    _LEGACY_AGENT = True
+
+except ImportError:
+    _LEGACY_AGENT = False
+
+    # ── 用 langgraph.prebuilt 实现等价的 create_tool_calling_agent + AgentExecutor ──
+    from langgraph.prebuilt import create_react_agent as _langgraph_create_react_agent
+
+    class ConversationBufferMemory:  # type: ignore[no-redef]
+        """最简 ConversationBufferMemory 兼容层"""
+        def __init__(self, memory_key: str = "chat_history", return_messages: bool = True):
+            self.memory_key = memory_key
+            self.return_messages = return_messages
+            self._messages: list = []
+
+        def load_memory_variables(self, inputs: dict) -> dict:
+            return {self.memory_key: list(self._messages)}
+
+        def save_context(self, inputs: dict, outputs: dict) -> None:
+            self._messages.append(_HumanMsg(content=inputs.get("input", "")))
+            self._messages.append(_AIMsg(content=outputs.get("output", "")))
+
+        def clear(self) -> None:
+            self._messages.clear()
+
+    class AgentExecutor:  # type: ignore[no-redef]
+        """将 langgraph.prebuilt.create_react_agent 包装为 AgentExecutor 接口"""
+        def __init__(self, agent, tools, memory=None, verbose: bool = False, **kw):
+            self._graph = agent   # create_react_agent 返回的 LangGraph app
+            self.memory = memory
+            self._verbose = verbose
+
+        def _build_messages(self, user_input: str) -> list:
+            messages: list = []
+            if self.memory:
+                hist = self.memory.load_memory_variables({}).get("chat_history", [])
+                if isinstance(hist, list):
+                    messages.extend(hist)
+            messages.append(_HumanMsg(content=user_input))
+            return messages
+
+        def _extract_output(self, result: dict, user_input: str) -> dict:
+            """取**最后一条有正文的 AIMessage**，避免末尾是 ToolMessage 时 output 非自然语言、档案无法解析。"""
+            out_msgs = result.get("messages", []) or []
+            output = ""
+            for m in reversed(out_msgs):
+                if m.__class__.__name__ != "AIMessage":
+                    continue
+                c = getattr(m, "content", None)
+                if isinstance(c, str) and c.strip():
+                    output = c
+                    break
+            if not output and out_msgs:
+                last = out_msgs[-1]
+                c = getattr(last, "content", None)
+                output = c if isinstance(c, str) else (str(c) if c is not None else "")
+            if self.memory:
+                self.memory.save_context({"input": user_input}, {"output": output})
+            return {"output": output}
+
+        def invoke(self, inputs: dict, config: dict | None = None) -> dict:
+            user_input = inputs.get("input", "")
+            messages = self._build_messages(user_input)
+            cfg = dict(config or {})
+            cfg.setdefault("recursion_limit", 50)
+            result = self._graph.invoke({"messages": messages}, config=cfg)
+            return self._extract_output(result, user_input)
+
+        async def ainvoke(self, inputs: dict, config: dict | None = None) -> dict:
+            user_input = inputs.get("input", "")
+            messages = self._build_messages(user_input)
+            cfg = dict(config or {})
+            cfg.setdefault("recursion_limit", 50)
+            result = await self._graph.ainvoke({"messages": messages}, config=cfg)
+            return self._extract_output(result, user_input)
+
+    def create_tool_calling_agent(llm, tools, prompt):  # type: ignore[misc]
+        """langchain 1.x 兼容：用 langgraph.prebuilt 创建 tool-calling 智能体"""
+        # 从 prompt 提取已 partial 的 system 文本
+        try:
+            # prompt 已经 .partial(tools_overview=...) 过，直接 format 不含占位符的部分
+            sys_text = prompt.messages[0].prompt.template
+            # 删掉 {tools} / {tool_names} 占位符行（对 langgraph 无意义）
+            import re
+            sys_text = re.sub(r"\n?You have access to the following tools:.*?(?=\n\n|\Z)", "",
+                              sys_text, flags=re.S)
+            sys_text = re.sub(r"\n?Valid tool names:.*?(?=\n\n|\Z)", "", sys_text, flags=re.S)
+        except Exception:
+            sys_text = "你是一名专业的柑橘病虫害诊断助手。"
+        # tools_overview 已 partial 注入，直接格式化（不含动态占位符）
+        try:
+            sys_text = sys_text.format(tools_overview="")
+        except Exception:
+            pass
+        from langchain_core.messages import SystemMessage as _SysMsg
+        return _langgraph_create_react_agent(llm, tools, prompt=_SysMsg(content=sys_text.strip()) if sys_text.strip() else None)
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from urllib.parse import urlparse
@@ -450,11 +558,6 @@ class CitrusDiseasePredictor:
 
 
 
-# 检索方案：改用 BM25 稀疏检索（避免本地向量嵌入引发的互斥锁）
-faiss = None
-SentenceTransformer = None
-print("ℹ️ [RAG] 使用 BM25 稀疏检索器（已禁用本地向量嵌入）。")
-
 # --- 配置加载 ---
 # 从 .env 文件加载环境变量
 load_dotenv()
@@ -469,23 +572,14 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")  # deepseek | kimi
 # 获取脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STRUCTURED_DATA_PATH = os.path.join(SCRIPT_DIR, "结构化数据.json")
-# 默认嵌入模型路径（可被环境变量覆盖）
-DEFAULT_EMBED_MODEL_PATH = "/Users/letaotao/.cache/modelscope/BAAI/bge-small-zh-v1.5"
-#DEFAULT_EMBED_MODEL_PATH = os.path.join(SCRIPT_DIR, ".rag_cache", "bge-small-zh-v1.5")
-
 
 # --- RAG 管理器 ---
 class RAGManager:
-    """封装RAG数据加载、索引和检索逻辑"""
-    def __init__(self, filepath: str, embed_model_path: str):
+    """使用 LangChain 内置检索器的 RAG 管理器"""
+    def __init__(self, filepath: str):
         self.filepath = filepath
-        self.embed_model_path = embed_model_path
-        self.docs = []
-        self.doc_texts = []
-        self.doc_metas = []
-        self.faiss_index = None  # 兼容属性
-        self.embedder = None     # 兼容属性
-        self.bm25 = None
+        self.documents = []
+        self.retriever = None
         self._load_and_build()
 
     def _flatten_record_to_text(self, record: dict) -> str:
@@ -516,8 +610,10 @@ class RAGManager:
         return "\n".join(parts)
 
     def _load_and_build(self):
-        """加载数据文件并构建向量索引"""
+        """加载数据文件并构建检索器"""
         try:
+            from langchain_core.documents import Document
+            
             with open(self.filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
@@ -525,22 +621,34 @@ class RAGManager:
             for rec in raw_docs:
                 if isinstance(rec, dict):
                     text = self._flatten_record_to_text(rec)
-                    self.docs.append({"text": text, "meta": rec})
+                    # 使用 LangChain Document 格式
+                    doc = Document(
+                        page_content=text,
+                        metadata={
+                            "disease_name": rec.get("名称", "未命名条目"),
+                            "category": rec.get("分类", ""),
+                            "aliases": rec.get("别名", []),
+                            "source": "structured_data"
+                        }
+                    )
+                    self.documents.append(doc)
             
-            if not self.docs:
-                print("[RAG] 警告：未从结构化数据文件中解析到有效记录。" )
+            if not self.documents:
+                print("[RAG] 警告：未从结构化数据文件中解析到有效记录。")
                 return
 
-            print(f"[RAG] 已加载 {len(self.docs)} 条结构化记录用于检索。" )
-            self.doc_texts = [d["text"] for d in self.docs]
-            self.doc_metas = [d["meta"] for d in self.docs]
-
-            # 构建 BM25 检索器
+            print(f"[RAG] 已加载 {len(self.documents)} 条结构化记录用于检索。")
+            
+            # 构建 BM25 检索器，设置更好的参数
             try:
-                self.bm25 = BM25Retriever.from_texts(self.doc_texts, metadatas=self.doc_metas)
-                print(f"[RAG] BM25 检索器已构建，文档数={len(self.doc_texts)}")
+                self.retriever = BM25Retriever.from_documents(
+                    self.documents,
+                    k=10  # 增加检索数量，后续再筛选
+                )
+                print(f"[RAG] BM25 检索器已构建，文档数={len(self.documents)}")
             except Exception as e:
-                print(f"[RAG] 构建 BM25 检索器失败，将回退到关键词检索: {e}")
+                print(f"[RAG] 构建 BM25 检索器失败: {e}")
+                self.retriever = None
 
         except FileNotFoundError:
             print(f"[RAG] 错误：未找到结构化数据文件: {self.filepath}")
@@ -550,68 +658,84 @@ class RAGManager:
             print(f"[RAG] 错误：加载或构建RAG时出错: {e}")
 
     def search(self, query: str, k: int = 3) -> list:
-        """执行混合检索并返回结构化结果"""
-        if not self.docs:
+        """执行检索并返回结构化结果"""
+        if not self.documents:
             return []
-        # 术语归一
-        query = self.normalize_terms(query)
-
-        # 方案1: BM25 稀疏检索
-        if self.bm25:
-            try:
-                docs = self.bm25.get_relevant_documents(query)
-                results = []
-                for doc in docs[:k]:
-                    text = getattr(doc, "page_content", "")
-                    meta = getattr(doc, "metadata", {}) or {}
-                    kw_score = self._calculate_kw_score(text, query, is_fallback=True)
-                    results.append({
-                        "disease_name": meta.get("名称", "未命名条目"),
-                        "document": (text[:500] + "...") if text else "",
-                        "rag_score": kw_score,
-                        "meta": meta
-                    })
-                if results:
-                    return results
-            except Exception as e:
-                print(f"[RAG] BM25 检索失败，回退至关键词检索: {e}")
-
-        # 方案2: 关键词检索 (回退)
-        ranked = sorted(
-            (
-                {
-                    "score": self._calculate_kw_score(doc["text"], query, is_fallback=True),
-                    "name": doc["meta"].get("名称", "未命名条目"),
-                    "snippet": doc["text"][:500] + "...",
-                    "meta": doc["meta"]
-                }
-                for doc in self.docs
-            ),
-            key=lambda x: x["score"],
-            reverse=True
-        )
-        top = [r for r in ranked if r["score"] > 0][:k]
-        return [
-            {
-                "disease_name": item["name"],
-                "document": item["snippet"],
-                "rag_score": item["score"],
-                "meta": item["meta"]
-            } for item in top
-        ]
-
-    def _calculate_kw_score(self, text: str, q: str, is_fallback=False) -> float:
-        """计算关键词匹配分数"""
-        score = 0.0
-        if q in text:
-            score += 1.5 if not is_fallback else 2.0
         
-        tokens = [t for t in q.replace("/", " ").replace("\\", " ").split() if t]
-        if not tokens:
-            score += sum(text.count(c) for c in q) * (0.05 if not is_fallback else 1.0)
+        # 术语归一化
+        query = self.normalize_terms(query)
+        
+        # 如果检索器可用，先尝试 BM25 检索
+        if self.retriever:
+            try:
+                docs = self.retriever.invoke(query)
+            except Exception as e:
+                print(f"[RAG] BM25 检索失败，回退到关键词检索: {e}")
+                docs = self.documents
         else:
-            score += sum(text.count(t) for t in tokens) * (0.2 if not is_fallback else 1.0)
-        return score
+            docs = self.documents
+        
+        # 计算相关性评分
+        results = []
+        for doc in docs:
+            # 计算改进的关键词匹配评分
+            content = doc.page_content.lower()
+            query_lower = query.lower()
+            
+            # 基础评分
+            score = 0.0
+            
+            # 名称完全匹配
+            disease_name = doc.metadata.get("disease_name", "").lower()
+            if query_lower in disease_name:
+                score += 20.0
+            
+            # 别名匹配
+            aliases = doc.metadata.get("aliases", [])
+            for alias in aliases:
+                if query_lower in alias.lower():
+                    score += 15.0
+            
+            # 分类匹配
+            category = doc.metadata.get("category", "").lower()
+            if query_lower in category:
+                score += 10.0
+            
+            # 内容完全匹配
+            if query_lower in content:
+                score += 8.0
+            
+            # 分词匹配（提高权重）
+            query_words = query_lower.split()
+            for word in query_words:
+                if len(word) > 1:  # 忽略单字符
+                    if word in content:
+                        score += 3.0
+                    if word in disease_name:
+                        score += 5.0
+            
+            # 症状关键词特殊匹配
+            symptom_keywords = ["黄化", "斑点", "病斑", "卷曲", "变形", "流胶", "枯萎", "白粉", "煤烟", "变小", "变硬", "褪绿", "红鼻子果"]
+            for keyword in symptom_keywords:
+                if keyword in query_lower and keyword in content:
+                    score += 6.0
+            
+            # 疾病关键词特殊匹配
+            disease_keywords = ["炭疽", "溃疡", "疮痂", "黄龙病", "蓟马", "红蜘蛛", "潜叶蛾", "锈壁虱", "脂点黄斑"]
+            for keyword in disease_keywords:
+                if keyword in query_lower and keyword in content:
+                    score += 8.0
+            
+            results.append({
+                "disease_name": doc.metadata.get("disease_name", "未命名条目"),
+                "document": doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content,
+                "rag_score": score,
+                "meta": doc.metadata
+            })
+        
+        # 按评分排序并返回前k个
+        results.sort(key=lambda x: x["rag_score"], reverse=True)
+        return results[:k]
 
     def normalize_terms(self, text: str) -> str:
         """将常见同义/俗称统一为标准术语以增强检索召回。"""
@@ -625,8 +749,16 @@ class RAGManager:
             "卷叶": "叶片卷曲",
             # 媒介/虫害
             "红蜘蛛": "螨", "螨虫": "螨",
-            # 病名常见简写（示例）
+            # 病名常见简写
             "溃疡": "溃疡病", "疮痂": "疮痂病",
+            # 症状描述
+            "叶子": "叶片", "叶子黄": "叶片黄化",
+            "果实小": "果实变小", "果实硬": "果实变硬",
+            "叶子黄化": "叶片黄化", "叶子卷曲": "叶片卷曲",
+            "叶子斑点": "叶片斑点", "叶子病斑": "叶片病斑",
+            # 疾病别名
+            "黄梢病": "黄龙病", "立枯病": "黄龙病", "退死病": "黄龙病",
+            "梢枯病": "黄龙病", "叶斑病": "黄龙病", "青果病": "黄龙病",
         }
         t = text
         for k, v in mapping.items():
@@ -637,7 +769,8 @@ class RAGManager:
 # 预先实例化 RAG 管理器和 LLM，避免在多线程环境中延迟加载引发问题
 
 try:
-    rag_manager = RAGManager(STRUCTURED_DATA_PATH, DEFAULT_EMBED_MODEL_PATH)
+    rag_manager = RAGManager(STRUCTURED_DATA_PATH)
+    print("✅ RAG 管理器初始化成功")
 
 except Exception as e:
     print(f"❌ RAG 管理器初始化失败: {e}")
@@ -681,57 +814,446 @@ def get_llm():
     """获取已初始化的 LLM 实例。"""
     return llm
 # --- 多模态辅助 ---
+def _url_to_local_path(url: str) -> str | None:
+    """将 /uploads/xxx 形式的 URL 解析为本地文件绝对路径"""
+    try:
+        parsed = urlparse(url)
+        path_part = parsed.path or ""
+        uploads_dir = os.path.join(os.path.dirname(os.path.dirname(SCRIPT_DIR)), "uploads")
+        if path_part.startswith("/uploads/"):
+            rel = path_part[len("/uploads/"):]
+            local_path = os.path.join(uploads_dir, rel)
+            if os.path.exists(local_path):
+                return local_path
+        # data URL / base64 直接返回原始 URL，让 vision_engine 处理
+        if url.startswith("data:"):
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def _vision_engine_summary(image_urls: list[str]) -> str | None:
+    """尝试用本地 CitrusHVT 视觉模型分析图片，返回结构化摘要文本。
+    若模型不可用或全部失败则返回 None。
+    """
+    try:
+        from app.services.vision_engine import vision_engine
+        parts: list[str] = []
+        for url in image_urls:
+            try:
+                local = _url_to_local_path(url)
+                if local and not local.startswith("data:"):
+                    result = vision_engine.predict_from_path(local)
+                elif url.startswith("data:"):
+                    result = vision_engine.predict_from_url(url)
+                else:
+                    continue
+                if result:
+                    top = result.get("top_k", [])
+                    ood = result.get("is_ood", False)
+                    if ood:
+                        parts.append("图片超出模型识别范围（非柑橘病害图片）")
+                    elif top:
+                        best = top[0]
+                        zh  = best.get("class_zh") or best.get("zh_name") or best.get("name", "未知")
+                        prob = best.get("probability", 0)
+                        coarse = best.get("coarse_class") or best.get("coarse", "")
+                        parts.append(f"本地视觉模型识别：{zh}（{coarse}），置信度 {prob:.1%}")
+            except Exception:
+                continue
+        return "\n".join(parts) if parts else None
+    except ImportError:
+        return None
+
+
 async def summarize_images(image_urls: list[str], instruction: str | None = None) -> str:
     """对上传的图片进行简述提取关键信息。
-    如果底层模型支持 vision（如 Kimi），用 image_url 多模态消息；否则回退为文本提示。
+    优先用本地视觉模型；若不可用且 LLM_PROVIDER 支持 vision 则用多模态；
+    否则回退为纯文本提示（不发送 image_url，避免不支持视觉的模型报 400）。
     """
     if not image_urls:
         return ""
+
+    # 优先：本地 vision_engine
+    local_summary = _vision_engine_summary(image_urls)
+    if local_summary:
+        return local_summary
+
     prompt = instruction or (
         "请查看这些柑橘图片，总结可见的病症/虫害线索：\n"
         "- 关注病斑形态、颜色、分布部位（叶片/果实/枝干）\n"
         "- 是否有煤污/霉层/流胶/虫害痕迹\n"
         "- 给出2-4条要点，简短即可"
     )
-    # 将本地/私网URL转为 data URL，避免外部模型无法访问
-    def to_data_url(url: str) -> str:
-        try:
-            parsed = urlparse(url)
-            host = parsed.hostname or ""
-            if parsed.scheme in ("http", "https") and host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-                return url
-            # 解析本地 uploads 目录文件
-            uploads_dir = os.path.join(os.path.dirname(os.path.dirname(SCRIPT_DIR)), "uploads")
-            path_part = parsed.path or ""
-            if path_part.startswith("/uploads/"):
-                rel = path_part[len("/uploads/"):]
-                local_path = os.path.join(uploads_dir, rel)
-                if os.path.exists(local_path):
-                    with open(local_path, "rb") as f:
+
+    # 支持 vision 的 provider（如 kimi）才发 image_url
+    if LLM_PROVIDER == "kimi":
+        def to_data_url(url: str) -> str:
+            try:
+                local = _url_to_local_path(url)
+                if local and not local.startswith("data:"):
+                    with open(local, "rb") as f:
                         data = f.read()
-                    mime, _ = mimetypes.guess_type(local_path)
+                    mime, _ = mimetypes.guess_type(local)
                     mime = mime or "image/jpeg"
-                    b64 = base64.b64encode(data).decode("utf-8")
-                    return f"data:{mime};base64,{b64}"
+                    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+            except Exception:
+                pass
+            return url
+
+        try:
+            safe_urls = [to_data_url(u) for u in image_urls]
+            content = [{"type": "text", "text": prompt}] + [
+                {"type": "image_url", "image_url": {"url": u}} for u in safe_urls
+            ]
+            msg = HumanMessage(content=content)
+            resp = await get_llm().ainvoke([msg])
+            return getattr(resp, "content", "") or str(resp)
         except Exception:
             pass
-        return url
 
+    # 回退：纯文本，不发 image_url（DeepSeek 等不支持视觉的模型）
+    text_prompt = (
+        f"{prompt}\n\n"
+        f"（用户上传了 {len(image_urls)} 张图片，请根据以上诊断提示和对话上下文进行分析）"
+    )
+    resp = await get_llm().ainvoke(text_prompt)
+    return getattr(resp, "content", "") or str(resp)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 并行双路视觉分析
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _vision_engine_raw(image_urls: list[str]) -> dict | None:
+    """同步：用本地 CitrusHVT 推理第一张有效图片，返回原始结果字典。"""
     try:
+        from app.services.vision_engine import vision_engine
+        if not vision_engine.is_available:
+            return None
+        for url in image_urls:
+            local = _url_to_local_path(url)
+            try:
+                if local and not local.startswith("data:"):
+                    result = vision_engine.predict_from_path(local)
+                else:
+                    result = vision_engine.predict_from_url(url)
+                if result and result.get("available"):
+                    return result
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        print(f"[VisionRaw] CNN 推理失败: {e}")
+        return None
+
+
+# 与 LangGraph calculate_confidence_node 快通路阈值对齐（论文 5.4.4.6）
+_FAST_PATH_VISION_THRESHOLD = 0.85
+_FAST_PATH_ENV_CONFLICT_MAX = 20.0
+
+
+def _cnn_hint_lines(cnn: dict | None) -> str:
+    """供多模态/文本解释用的 CNN 摘要文本。"""
+    if not cnn or not cnn.get("available"):
+        return "（本地模型无有效输出）"
+    lines = []
+    for item in (cnn.get("top_k") or [])[:3]:
+        lines.append(
+            f"  Top{item.get('rank', '?')}: {item.get('class_zh', '?')} "
+            f"({item.get('probability', 0):.1%}) — {item.get('coarse_class', '')}"
+        )
+    ood = cnn.get("is_ood", False)
+    if ood:
+        lines.append("  （OOD：分布外样本，标签仅供参考）")
+    return "\n".join(lines) if lines else "（无 Top-K）"
+
+
+async def _llm_vision_describe(
+    image_urls: list[str],
+    cnn_hint: dict | None = None,
+) -> str | None:
+    """
+    多模态 LLM（Kimi 等）：在**已得到 CNN 标签之后**看图描述，实现「标签引导的视觉解释」
+    （符合论文 late fusion：感知层特征 + 决策层语义解释）。
+    """
+    if LLM_PROVIDER != "kimi":
+        return None
+    base = (
+        "你是柑橘植保专家。请结合下方图片，用中文简洁描述可见情况。\n"
+        "1. 病斑/症状的颜色、形态、分布部位（叶/果/枝等）\n"
+        "2. 是否有虫害痕迹、霉层、流胶等\n"
+        "3. 与本地模型结论是否一致；若不一致，说明可能原因（拍摄角度、非柑橘、复合症状等）\n"
+        "用 3-6 句话，不要编造图中没有的细节。"
+    )
+    if cnn_hint and cnn_hint.get("available"):
+        base += (
+            "\n\n【本地 CitrusHVT 模型输出（请先参考再对照实图）】\n"
+            f"{_cnn_hint_lines(cnn_hint)}"
+        )
+    prompt_text = base
+    try:
+        def to_data_url(url: str) -> str:
+            try:
+                local = _url_to_local_path(url)
+                if local and not local.startswith("data:"):
+                    with open(local, "rb") as f:
+                        raw = f.read()
+                    mime, _ = mimetypes.guess_type(local)
+                    return f"data:{mime or 'image/jpeg'};base64,{base64.b64encode(raw).decode()}"
+            except Exception:
+                pass
+            return url
+
         safe_urls = [to_data_url(u) for u in image_urls]
-        content = [{"type": "text", "text": prompt}] + [
-            {"type": "image_url", "image_url": {"url": url}}
-            for url in safe_urls
+        content = [{"type": "text", "text": prompt_text}] + [
+            {"type": "image_url", "image_url": {"url": u}} for u in safe_urls
         ]
-        msg = HumanMessage(content=content)
-        resp = await get_llm().ainvoke([msg])
+        resp = await get_llm().ainvoke([HumanMessage(content=content)])
         return getattr(resp, "content", "") or str(resp)
-    except Exception:
-        # 回退：将URL作为文本交给模型参考
-        joined = "\n".join(image_urls)
-        text_prompt = f"以下是用户上传的图片URL（模型若不支持图像，可按文字参考）：\n{joined}\n\n{prompt}"
-        resp = await get_llm().ainvoke(text_prompt)
+    except Exception as e:
+        print(f"[VisionLLM] 多模态描述失败: {e}")
+        return None
+
+
+async def _llm_text_explain_from_cnn(cnn: dict) -> str | None:
+    """
+    文本 LLM（如 DeepSeek）：无法看图时，根据 CNN 标签做「面向农户的症状学解释」，
+    明确说明未直接读图，避免与多模态路径混淆。
+    """
+    if not cnn or not cnn.get("available"):
+        return None
+    hint = _cnn_hint_lines(cnn)
+    prompt = (
+        "本地柑橘病害识别模型输出如下（你当前**无法查看用户图片**，仅根据标签做科普解释）：\n"
+        f"{hint}\n\n"
+        "请用 4-7 句中文写给农户：（1）按模型最可能的一类，描述田间常见症状与受害部位；"
+        "（2）提醒最终以田间观察与农技人员判断为准；（3）不要编造模型未给出的病虫类别名称。"
+        "开头请用一句说明：「以下为结合识别结果的症状学说明，非直接读图」。"
+    )
+    try:
+        resp = await get_llm().ainvoke(prompt)
         return getattr(resp, "content", "") or str(resp)
+    except Exception as e:
+        print(f"[VisionTextLLM] 文本解释失败: {e}")
+        return None
+
+
+async def _sequential_vision_analyze(image_urls: list[str]) -> dict:
+    """
+    串行视觉链（符合「先感知标签、再语义解释」）：
+      1) 本地 CNN（CitrusHVT）→ top-k / OOD / fuzzy_disease_key
+      2) Kimi：图片 + CNN 标签 → 对照实图的描述；
+         DeepSeek 等：仅根据 CNN 做文本层症状解释（不声称已读图）。
+    """
+    loop = asyncio.get_event_loop()
+    cnn_result = await loop.run_in_executor(None, _vision_engine_raw, image_urls)
+    if isinstance(cnn_result, Exception):
+        print(f"[Vision] CNN 出错: {cnn_result}")
+        cnn_result = None
+
+    llm_desc: str | None = None
+    if LLM_PROVIDER == "kimi":
+        llm_desc = await _llm_vision_describe(image_urls, cnn_hint=cnn_result)
+    else:
+        llm_desc = await _llm_text_explain_from_cnn(cnn_result or {})
+
+    return {"cnn": cnn_result, "llm_desc": llm_desc}
+
+
+async def _load_environmental_risk(session_id: str) -> dict:
+    """
+    与 LangGraph parallel_context 一致：果园坐标天气 + CitrusFuzzyEngine →
+    {病名: {risk_score, risk_level}}，供快通路环境一致性核验。
+    """
+    oid = get_orchard_id(session_id)
+    if not oid:
+        return {}
+    db = SessionLocal()
+    try:
+        o = orchard_crud.get_orchard(db, orchard_id=oid)
+        if not o:
+            return {}
+        phenology = 0.7
+        if getattr(o, "current_phenology", None):
+            _ph_map = {
+                "休眠期": 0.2,
+                "萌芽期": 0.5,
+                "生长期": 0.8,
+                "花期": 0.7,
+                "结果期": 0.6,
+            }
+            phenology = float(_ph_map.get(o.current_phenology, 0.7))
+        temp, hum, rain = 25.0, 65.0, 0.0
+        if o.location_latitude is not None and o.location_longitude is not None:
+            try:
+                from app.services.weather_service import weather_service
+
+                w = await weather_service.get_weather_by_coordinates(
+                    float(o.location_latitude),
+                    float(o.location_longitude),
+                )
+                if w:
+                    cur = w.get("current") or {}
+                    temp = float(cur.get("temperature", 25) or 25)
+                    hum = float(cur.get("humidity", 65) or 65)
+                    fc = w.get("forecast") or []
+                    if fc:
+                        rain = float(fc[0].get("precipitation_total", 0) or 0)
+            except Exception as e:
+                print(f"[EnvRisk] 天气获取失败: {e}")
+
+        from app.services.fuzzy_engine import CitrusFuzzyEngine
+
+        raw = CitrusFuzzyEngine().predict(
+            {
+                "temp": temp,
+                "humidity": hum,
+                "rainfall": rain,
+                "phenology": phenology,
+            }
+        )
+        return {
+            disease: {
+                "risk_score": float(info.get("risk_score", 0.0)),
+                "risk_level": str(info.get("risk_level", "")),
+            }
+            for disease, info in raw.items()
+        }
+    except Exception as e:
+        print(f"[EnvRisk] 模糊推理失败: {e}")
+        return {}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _evaluate_fast_path_gate(cnn: dict | None, env_risk: dict) -> tuple[bool, list[str]]:
+    """
+    论文快通路：高置信视觉 + 与模糊环境风险无显著冲突（对齐 graph calculate_confidence_node）。
+    返回 (是否允许快通路, 人类可读说明行)。
+    """
+    notes: list[str] = []
+    if not cnn or not cnn.get("available"):
+        notes.append("  · 无有效 CNN 输出 → 不走快通路")
+        return False, notes
+    if cnn.get("is_ood", False):
+        notes.append("  · OOD 样本 → 不走快通路")
+        return False, notes
+    top1_prob = float(cnn.get("top1_prob", 0.0))
+    if top1_prob < _FAST_PATH_VISION_THRESHOLD:
+        notes.append(
+            f"  · 视觉 Top-1 置信度 {top1_prob:.1%} < {_FAST_PATH_VISION_THRESHOLD:.0%} → 不走快通路"
+        )
+        return False, notes
+
+    fuzzy_key = cnn.get("fuzzy_disease_key") or ""
+    if fuzzy_key and env_risk:
+        info = env_risk.get(fuzzy_key)
+        if not isinstance(info, dict):
+            info = {}
+        env_score = float(info.get("risk_score", 50.0))
+        if fuzzy_key not in env_risk:
+            notes.append(
+                f"  · 环境表中未单独列出「{fuzzy_key}」，按默认风险分 {env_score:.0f}/100 参与门控"
+            )
+        if env_score < _FAST_PATH_ENV_CONFLICT_MAX:
+            notes.append(
+                f"  · 环境核验：**冲突** — 模糊推理中「{fuzzy_key}」风险仅 {env_score:.0f}/100 "
+                f"(<{_FAST_PATH_ENV_CONFLICT_MAX:.0f})，与高置信视觉不一致 → **禁止快通路**，走慢通路"
+            )
+            return False, notes
+        notes.append(
+            f"  · 环境核验：「{fuzzy_key}」风险 {env_score:.0f}/100，未出现极低风险冲突 → 快通路可用"
+        )
+    elif fuzzy_key and not env_risk:
+        notes.append(
+            "  · 环境核验：**未完成**（无果园绑定或模糊推理结果为空）→ 不满足论文「视觉-环境一致」"
+            "门控，**禁止快通路**，请走慢通路并调用 `fuzzy_risk_check` 或 `fetch_orchard_context`"
+        )
+        return False, notes
+    else:
+        notes.append("  · 无 fuzzy_disease_key（如健康类）→ 跳过病害-环境冲突项，仅凭视觉门控")
+
+    notes.append(
+        f"  · ✅ 快通路条件满足：视觉 Top-1 {cnn.get('top1_class_zh', '?')} @ {top1_prob:.1%}"
+    )
+    return True, notes
+
+
+def _format_env_risk_brief(env_risk: dict, highlight_key: str | None, max_items: int = 6) -> str:
+    if not env_risk:
+        return ""
+    lines = ["【环境模糊推理（当前果园气象+物候）】"]
+    items = sorted(
+        env_risk.items(),
+        key=lambda x: x[1].get("risk_score", 0),
+        reverse=True,
+    )[:max_items]
+    for name, info in items:
+        mark = " ← 与 CNN 对齐" if highlight_key and name == highlight_key else ""
+        lines.append(
+            f"  · {name}: {info.get('risk_level', '')}（{float(info.get('risk_score', 0)):.0f}/100）{mark}"
+        )
+    return "\n".join(lines)
+
+
+def _format_vision_slot(slot: dict) -> str:
+    """将 vision_slot 格式化为注入 Agent 的文本摘要（含环境门控后的快慢通路提示）。"""
+    parts: list[str] = []
+    cnn = slot.get("cnn")
+    llm_desc = slot.get("llm_desc")
+    gate = slot.get("fast_path_gate") or {}
+    env_brief = slot.get("env_risk_brief") or ""
+
+    if cnn and cnn.get("available"):
+        top_k = cnn.get("top_k", [])
+        is_ood = cnn.get("is_ood", False)
+        top1_prob = cnn.get("top1_prob", 0.0)
+        top1_zh = cnn.get("top1_class_zh", "未知")
+
+        parts.append("【视觉识别（本地CNN · CitrusHVT）】")
+        if is_ood:
+            parts.append("  ⚠️ 图片超出训练分布（OOD），识别可靠性低，请结合症状文字判断")
+        else:
+            for item in top_k[:3]:
+                parts.append(
+                    f"  Top{item['rank']}: {item['class_zh']} "
+                    f"({item['probability']:.1%}) — {item['coarse_class']}"
+                )
+            # 快慢通路由环境门控结果决定（与论文 5.4 一致），不再仅看置信度
+            if gate.get("allowed"):
+                parts.append(
+                    f"  ✅ **快通路已许可**：视觉 Top-1「{top1_zh}」（{top1_prob:.1%}）"
+                    "且通过环境一致性核验，可按快通路出具确诊型答复（仍需检索防治知识）。"
+                )
+            else:
+                if top1_prob >= _FAST_PATH_VISION_THRESHOLD and not is_ood:
+                    parts.append(
+                        f"  ⚠️ 视觉置信度较高（{top1_prob:.1%}），但**未满足快通路**（见下方门控说明）→ 走**慢通路**"
+                    )
+                elif top1_prob >= 0.55:
+                    parts.append(
+                        f"  ⚠️ 置信度中等（{top1_prob:.1%}），建议结合症状与环境走慢通路"
+                    )
+                else:
+                    parts.append(f"  ❓ 置信度较低（{top1_prob:.1%}）→ 走慢通路")
+
+        if gate.get("notes"):
+            parts.append("\n【快通路门控（视觉 + 环境模糊推理）】")
+            parts.extend(gate["notes"])
+
+    if env_brief:
+        parts.append("\n" + env_brief)
+
+    if llm_desc:
+        prov = "多模态LLM（已读图）" if LLM_PROVIDER == "kimi" else "文本LLM（结合CNN标签的症状学说明，非直接读图）"
+        parts.append(f"\n【视觉解释（{prov}）】\n{llm_desc}")
+
+    return "\n".join(parts)
 
 
 # --- 工具定义 ---
@@ -742,19 +1264,21 @@ def rag_search(query: str) -> str:
     返回格式化的字符串，包含名称、分数和文档片段。
     """
     print(f"--- 正在进行 RAG 检索: {query} ---")
-    if not query: return "请输入有效的检索问题。"
+    if not query: 
+        return "请输入有效的检索问题。"
     
-    results = get_rag_manager().search(query)
-    if not results: return f"未在知识库中检索到与'{query}'相关的信息。"
+    try:
+        results = get_rag_manager().search(query)
+        if not results: 
+            return f"未在知识库中检索到与'{query}'相关的信息。"
 
-    lines = []
-    for i, item in enumerate(results, 1):
-        title = item["disease_name"]
-        score_info = f"score={item['rag_score']:.3f}"
-        if "vector_score" in item:
-            score_info += f", vec={item['vector_score']:.3f}"
-        lines.append(f"[{i}] {title} ({score_info})\n{item['document']}")
-    return "\n\n".join(lines)
+        lines = []
+        for i, item in enumerate(results, 1):
+            title = item["disease_name"]
+            lines.append(f"[{i}] {title}\n{item['document']}")
+        return "\n\n".join(lines)
+    except Exception as e:
+        return f"❌ 检索过程中发生错误: {e}"
 
 @tool
 def knowledge_base_retrieval(context: str, top_k: int = 3) -> list:
@@ -763,10 +1287,16 @@ def knowledge_base_retrieval(context: str, top_k: int = 3) -> list:
     输出: [{"disease_name", "document", "rag_score"}]
     """
     print("[诊断] 步骤2/5: 知识库检索 Top-3 候选…")
-    if not context: return []
-    results = get_rag_manager().search(get_rag_manager().normalize_terms(context), k=top_k)
-    print(f"[诊断] 检索完成，命中 {len(results)} 条候选。")
-    return results
+    if not context: 
+        return []
+    
+    try:
+        results = get_rag_manager().search(context, k=top_k)
+        print(f"[诊断] 检索完成，命中 {len(results)} 条候选。")
+        return results
+    except Exception as e:
+        print(f"[诊断] 检索失败: {e}")
+        return []
 
 
 
@@ -1125,9 +1655,12 @@ def calculate_confidence(candidates: list, analysis: dict, w1: float = 0.35, w2:
         elif top > 0.60:
             level = "medium"
             decision = "clarify"
-        else:
+        elif top > 0.40:
             level = "low"
             decision = "clarify"
+        else:
+            level = "very_low"
+            decision = "unknown"
         print(f"[诊断] 步骤4/5: 置信度计算完成。Top={top:.3f}，差值={lead:.3f}，等级={level}，决策={decision}")
     else:
         print("[诊断] 步骤4/5: 无可计算对象。")
@@ -1140,8 +1673,22 @@ def generate_clarifying_question(analysis: dict, ranked) -> dict:
     # 兼容两种输入格式
     if isinstance(ranked, list):
         ranked_list = ranked
+        decision = "clarify"
+        top_val = ranked[0].get("confidence", 0) if ranked else 0
     else:
         ranked_list = ranked.get("ranked", [])
+        decision = ranked.get("decision", "clarify")
+        top_val = ranked.get("top", 0)
+
+    # 处理极低置信度的情况（系统不知道）
+    if decision == "unknown" or top_val < 0.40:
+        print(f"[诊断] 步骤5/5: 置信度过低 ({top_val:.2f})，请求补充信息而非强行区分。")
+        return {
+            "type": "clarification",
+            "question": "当前的症状特征与已知病害匹配度均较低，可能是特征不明显或属于未收录病害。请问能否拍摄更清晰的病斑细节，或描述是否有其他部位（如枝干、根部）的异常？",
+            "options": ["补充症状描述", "上传更多图片", "结束诊断"]
+        }
+
     top2 = [r.get("disease_name") for r in ranked_list[:2]]
     prompt = (
         "根据以下分析，生成一个能够区分Top-2病害的关键问题（简短、可观察、明确），并提供3个选项：\n\n" 
@@ -1281,13 +1828,43 @@ def fetch_orchard_context(orchard_id: str | None = None) -> str:
         except Exception:
             pass
 
+@tool
+def fuzzy_risk_check(temperature: float, humidity: float, rainfall: float = 0.0, phenology: float = 0.7) -> str:
+    """
+    (环境风险) 调用模糊推理引擎，评估当前气象条件下各病虫害的发生风险评分。
+    temperature : 气温 (°C)
+    humidity    : 相对湿度 (%)
+    rainfall    : 降雨量 (mm，默认 0)
+    phenology   : 物候期 (0~1; 0.2=休眠 0.5=萌芽 0.7=生长 0.8=花期 0.9=果期，默认 0.7)
+    输出各病虫害的风险等级和评分 (0~100)。
+    在慢通路中，可用此工具的输出作为 calculate_confidence 的环境加权依据。
+    """
+    try:
+        from app.services.fuzzy_engine import CitrusFuzzyEngine
+        engine = CitrusFuzzyEngine()
+        result = engine.predict({
+            "temp": float(temperature),
+            "humidity": float(humidity),
+            "rainfall": float(rainfall),
+            "phenology": float(phenology),
+        })
+        lines = ["【模糊推理环境风险评估】"]
+        for disease, info in sorted(result.items(), key=lambda x: x[1].get("risk_score", 0), reverse=True):
+            score = info.get("risk_score", 0.0)
+            level = info.get("risk_level", "低风险")
+            lines.append(f"  {disease}: {level}（{score:.0f}/100）")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ 模糊推理失败: {e}"
+
+
 # --- Agent 初始化 ---
 # 将所有工具放入列表
 tools = [
     rag_search, knowledge_base_retrieval, get_weather, web_search,
     analyze_candidates, calculate_confidence, generate_clarifying_question, create_final_report,
     disease_risk_prediction, treatment_maintenance_advice,
-    fetch_orchard_context]
+    fetch_orchard_context, fuzzy_risk_check]
     
     
 # 从 LangChain Hub 加载提示词模板并补充自定义指导
@@ -1306,13 +1883,20 @@ tools_overview=(
         "--- 主要工作流 ---\n\n"
         "**0. 果园上下文**\n"
         "如果用户没有强调地址，就默认可以通过'fetch_orchard_context'自主调用用户果园有关的上下文，包含品种、生育期、树龄、地理坐标、土壤等。应在推理中恰当利用，但不可编造缺失字段。\n\n"
-        "**1. 诊断流程 (意图: '诊断/症状/什么病')**\n"
-        "当识别到用户意图涉及诊断时，必须按以下工具链顺序执行：\n"
-        "1) `knowledge_base_retrieval` 获取Top-3候选。\n"
-        "2) `analyze_candidates` 三维评分。\n"
-        "3) `calculate_confidence` 计算置信度。\n"
-        "4) 高置信 → `create_final_report`；否则 → `generate_clarifying_question`。\n"
-        "5) 用户回答后，将新信息融入上下文，重复流程。\n\n"
+        "**1. 诊断流程（意图：'诊断/症状/什么病'）**\n"
+        "系统已注入：①本地 CNN Top-K；②在 CNN 标签引导下的视觉解释（Kimi 为读图描述，DeepSeek 为基于标签的症状学说明）；"
+        "③果园气象驱动的模糊环境风险摘要；④**快通路门控**（高置信视觉 + 与 Top-1 对应病害的环境风险无「极低分」冲突，与论文 5.4 一致）。\n"
+        "请严格根据上下文【快通路门控】结论选路（勿仅凭主观判断绕过门控）：\n\n"
+        "🔵 **快通路**（仅当上下文写明「快通路已许可」时）：\n"
+        "  1) 以 CNN Top-1 为主诊断，并充分采纳【视觉解释】段落面向农户表述\n"
+        "  2) `knowledge_base_retrieval` + `create_final_report` 输出防治建议\n\n"
+        "🟡 **慢通路**（门控未许可 / OOD / 置信不足 / 纯文字无图 等）：\n"
+        "  1) `knowledge_base_retrieval` 获取 Top-3 候选（传入症状描述 + CNN 摘要）\n"
+        "  2) `analyze_candidates` 三维评分（症状/环境/病因）\n"
+        "  3) [可选] 若已知气温/湿度，调用 `fuzzy_risk_check` 获取环境风险作为加权参考\n"
+        "  4) `calculate_confidence` 融合评分\n"
+        "  5) 置信度 ≥ 0.7 → `create_final_report`；否则 → `generate_clarifying_question` 追问\n"
+        "  6) 追问最多 3 次，第 3 次后强制出具带不确定性说明的报告\n\n"
         "**2. 预测流程 (意图: '预测/预报/风险')**\n"
         "当用户想要预测未来病虫害风险时，按以下步骤操作：\n"
         "1) 询问用户目标城市和需要预测的天数(例如，未来7天)。日期需要根据当前提供的当前日期作为参考。\n"
@@ -1332,21 +1916,81 @@ tools_overview=(
         "- 文本内容使用 \\n 进行换行\n"
         "- 确保前端能够正确解析和显示"
     )
-    
-prompt = hub.pull("hwchase17/openai-tools-agent").partial(
-    tools_overview=tools_overview
-)
 
-# 创建 Agent
-agent = create_tool_calling_agent(get_llm(), tools, prompt)
+# 提示词模板：仅保留 create_tool_calling_agent 实际需要的占位符
+# {tools} / {tool_names} 是旧版 ReAct 专用，tool-calling agent 不注入它们，
+# 留在模板里会引发 KeyError，已移除。
+prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "{tools_overview}",
+        ),
+        MessagesPlaceholder(variable_name="chat_history", optional=True),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ]
+).partial(tools_overview=tools_overview)
 
-# 创建带记忆的 Agent 执行器
-agent_executor = AgentExecutor(
-    agent=agent,
-    tools=tools,
-    memory=ConversationBufferMemory(memory_key="chat_history", return_messages=True),
-    verbose=True
-)
+# 创建 Agent（无状态，memory 由各 session_ctx 持有）
+_agent_graph = create_tool_calling_agent(get_llm(), tools, prompt)
+
+
+# ── SessionCtx：每个 session 的完整上下文对象 ────────────────────────────────
+from dataclasses import dataclass, field as _dc_field
+
+@dataclass
+class _SessionCtx:
+    """
+    对话记忆（chat_history）与图像分析槽（image_slot）分开管理：
+    - chat_history  : 文字对话记忆，永久保留（最多 20 轮）
+    - image_slot    : 本轮图片的并行视觉分析结果，新图片到来时替换
+    - image_turn    : 图片上传时的 turn 编号（用于判断"图片是否仍新鲜"）
+    """
+    executor: "AgentExecutor"
+    current_turn: int = 0
+    image_slot: dict | None = None         # {"cnn": {...}, "llm_desc": str|None}
+    image_turn: int = -99
+    image_urls: list = _dc_field(default_factory=list)
+
+    def has_fresh_image(self, staleness: int = 3) -> bool:
+        """当前轮次距图片上传 ≤ staleness 轮 → 图片"仍新鲜"，可注入上下文"""
+        return (
+            self.image_slot is not None
+            and (self.current_turn - self.image_turn) <= staleness
+        )
+
+    def set_image(self, slot: dict, urls: list[str]) -> None:
+        self.image_slot = slot
+        self.image_turn = self.current_turn
+        self.image_urls = list(urls)
+
+    def advance_turn(self) -> None:
+        self.current_turn += 1
+
+
+_session_contexts: dict[str, "_SessionCtx"] = {}
+
+def _get_session_ctx(session_id: str) -> "_SessionCtx":
+    """获取或创建 session 级别的上下文对象（含独立 memory + image_slot）"""
+    if session_id not in _session_contexts:
+        mem = (
+            ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+            if ConversationBufferMemory is not None
+            else None
+        )
+        executor = AgentExecutor(
+            agent=_agent_graph,
+            tools=tools,
+            memory=mem,
+            verbose=True,
+        )
+        _session_contexts[session_id] = _SessionCtx(executor=executor)
+    return _session_contexts[session_id]
+
+
+# 全局 executor 仅供 agent_respond / main() 使用（无 session 上下文时的兜底）
+agent_executor = _get_session_ctx("__global__").executor
 
 # --- 诊断表单 ---
 def run_diagnostic_form() -> str:
@@ -1568,71 +2212,20 @@ def agent_respond(user_input: str) -> str:
 
 
 def agent_respond_stream(session_id: str, user_input: str) -> str:
-    """带回调的响应：将 LLM/工具进度通过 WebSocket 推送到 session。
-    返回最终输出（JSON字符串），实时状态由回调推送。
-    """
+    """同步版本（带 WebSocket 回调）。"""
     try:
+        ctx = _get_session_ctx(session_id)
+        ctx.advance_turn()
         callbacks = [WebSocketCallbackHandler(session_id)]
-        resp = agent_executor.invoke({"input": user_input}, config={"callbacks": callbacks})
-        output = resp.get("output", "")
-        try:
-            json.loads(output)
-            return output
-        except:
-            return json.dumps({
-                "type": "text",
-                "content": output
-            }, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({
-            "type": "text", 
-            "content": f"❌ 调用智能体失败: {e}"
-        }, ensure_ascii=False)
-
-
-async def agent_respond_stream_async(session_id: str, user_input: str, image_urls: list[str] | None = None) -> str:
-    """异步版本：
-    - 若提供 image_urls，则走多模态（HumanMessage content=[text,image_url...]）
-    - 否则走 Agent 执行器（工具链）
-    两种方式均通过回调实时推送到前端。
-    """
-    callbacks = [WebSocketCallbackHandler(session_id)]
-    try:
-        if image_urls:
-            # 多模态：同次调用中传入文本 + 图像
-            # 将本地/私网URL转成 data URL，避免云端不可访问
-            def to_data_url(url: str) -> str:
-                try:
-                    parsed = urlparse(url)
-                    host = parsed.hostname or ""
-                    if parsed.scheme in ("http", "https") and host not in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-                        return url
-                    uploads_dir = os.path.join(os.path.dirname(os.path.dirname(SCRIPT_DIR)), "uploads")
-                    path_part = parsed.path or ""
-                    if path_part.startswith("/uploads/"):
-                        rel = path_part[len("/uploads/"):]
-                        local_path = os.path.join(uploads_dir, rel)
-                        if os.path.exists(local_path):
-                            with open(local_path, "rb") as f:
-                                data = f.read()
-                            mime, _ = mimetypes.guess_type(local_path)
-                            mime = mime or "image/jpeg"
-                            b64 = base64.b64encode(data).decode("utf-8")
-                            return f"data:{mime};base64,{b64}"
-                except Exception:
-                    pass
-                return url
-
-            safe_urls = [to_data_url(u) for u in image_urls]
-            content = ([{"type": "text", "text": user_input or "请结合图片进行分析"}] +
-                       [{"type": "image_url", "image_url": {"url": u}} for u in safe_urls])
-            msg = HumanMessage(content=content)
-            resp = await get_llm().ainvoke([msg], config={"callbacks": callbacks})
-            text = getattr(resp, "content", "") or str(resp)
-            return json.dumps({"type": "text", "content": text}, ensure_ascii=False)
-
-        # 纯文本：走 Agent 工具链
-        resp = await agent_executor.ainvoke({"input": user_input}, config={"callbacks": callbacks})
+        # 图片槽仍新鲜时（追问场景），把图片摘要带进来
+        inject = []
+        if ctx.has_fresh_image():
+            v = _format_vision_slot(ctx.image_slot)
+            if v:
+                inject.append(v)
+        clean_input = _strip_url_lines(user_input)
+        final_input = "\n\n".join(inject + [clean_input]) if inject else clean_input
+        resp = ctx.executor.invoke({"input": final_input}, config={"callbacks": callbacks})
         output = resp.get("output", "")
         try:
             json.loads(output)
@@ -1641,6 +2234,124 @@ async def agent_respond_stream_async(session_id: str, user_input: str, image_url
             return json.dumps({"type": "text", "content": output}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"type": "text", "content": f"❌ 调用智能体失败: {e}"}, ensure_ascii=False)
+
+
+def _strip_url_lines(text: str) -> str:
+    """去掉纯 URL 行（如 agent_v2_service 拼接的图片 URL），避免 URL 被 LLM 误读。"""
+    lines = [l for l in (text or "").splitlines() if not l.strip().startswith("http")]
+    return "\n".join(lines).strip()
+
+
+def _pick_urls_for_independent_recognition(
+    image_urls: list[str],
+    previous_urls: list[str],
+) -> list[str]:
+    """
+    每次新传图独立识别，不把历史图片与本轮多张图叠加入 CNN/多模态：
+    - 相对上次会话绑定的 URL，找出本轮**新增** URL，只取其中**最后一张**做识别；
+    - 若本次列表全是旧 URL（前端重复带全量），则只对**本次列表最后一张**再跑一遍识别；
+    - 一次视觉推理只针对一张图，避免多张图塞进同一个 prompt。
+    """
+    if not image_urls:
+        return []
+    prev = {(u or "").strip() for u in (previous_urls or []) if u and str(u).strip()}
+    novel: list[str] = []
+    for u in image_urls:
+        s = (u or "").strip()
+        if not s:
+            continue
+        if s not in prev:
+            novel.append(s)
+    if novel:
+        return [novel[-1]]
+    all_clean = [(u or "").strip() for u in image_urls if (u or "").strip()]
+    return [all_clean[-1]] if all_clean else []
+
+
+async def agent_respond_stream_async(
+    session_id: str,
+    user_input: str,
+    image_urls: list[str] | None = None,
+) -> str:
+    """
+    异步主入口：
+    1. 新图片 → CNN 先行，再以 CNN 标签引导多模态/文本 LLM 解释；更新 image_slot
+    2. 拉取果园气象 + 模糊推理，做快通路「视觉-环境」门控（对齐论文 5.4 / LangGraph 节点）
+    3. 追问（无新图但图片仍新鲜）→ 携带上轮 image_slot（含门控结论）
+    4. 图片过期 → 不再自动注入
+    """
+    ctx = _get_session_ctx(session_id)
+    # 在 advance 之前快照上一轮已绑定的图 URL，用于判断「本轮是否新图」
+    prev_bound_urls = list(ctx.image_urls)
+    ctx.advance_turn()
+    callbacks = [WebSocketCallbackHandler(session_id)]
+
+    try:
+        # ── Step 1：串行视觉链 + 环境门控（仅本轮独立的一张新图）──────────
+        urls_for_vision: list[str] = []
+        if image_urls:
+            urls_for_vision = _pick_urls_for_independent_recognition(
+                image_urls, prev_bound_urls
+            )
+            if len(image_urls) > 1:
+                print(
+                    f"[AgentV2] 独立识别：本轮请求 {len(image_urls)} 个图片 URL，"
+                    f"视觉模型仅处理其中 1 张 → {urls_for_vision[0] if urls_for_vision else 'none'}"
+                )
+        if urls_for_vision:
+            print("[AgentV2] CNN → 标签引导 LLM 解释（单图）…")
+            slot = await _sequential_vision_analyze(urls_for_vision)
+            cnn = slot.get("cnn") or {}
+            env_risk = await _load_environmental_risk(session_id)
+            allowed, gate_notes = _evaluate_fast_path_gate(cnn if cnn.get("available") else None, env_risk)
+            hk = (cnn.get("fuzzy_disease_key") or "") if cnn.get("available") else None
+            slot["fast_path_gate"] = {"allowed": allowed, "notes": gate_notes}
+            slot["env_risk_brief"] = _format_env_risk_brief(env_risk, hk or None)
+            ctx.set_image(slot, urls_for_vision)
+            print(
+                f"[AgentV2] 视觉+环境门控完成 → CNN: {cnn.get('top1_class_zh', 'N/A')} "
+                f"({cnn.get('top1_prob', 0):.1%}), 快通路={'是' if allowed else '否'}, "
+                f"解释={'有' if slot.get('llm_desc') else '无'}"
+            )
+
+        # ── Step 2：构建注入上下文 ───────────────────────────────────
+        inject_parts: list[str] = []
+
+        # 本轮确实跑了新图识别时，明确声明与历史图片脱钩
+        if urls_for_vision:
+            inject_parts.append(
+                "【重要】以下视觉结论仅针对本轮新上传的**这一张**图片；"
+                "请勿与对话中更早的其他图片结论合并或混淆。"
+            )
+
+        # 图片上下文：本轮有图 OR 图片仍新鲜（追问同一图）
+        if ctx.image_slot and (urls_for_vision or ctx.has_fresh_image()):
+            vision_text = _format_vision_slot(ctx.image_slot)
+            if vision_text:
+                inject_parts.append(vision_text)
+
+        # 清理用户文本（去掉 URL 行，避免 DeepSeek 等文本模型报错）
+        clean_input = _strip_url_lines(user_input) or "请根据图片信息进行诊断"
+
+        final_input = "\n\n".join(inject_parts + [clean_input]) if inject_parts else clean_input
+
+        # ── Step 3：调用 Agent ───────────────────────────────────────
+        resp = await ctx.executor.ainvoke(
+            {"input": final_input},
+            config={"callbacks": callbacks},
+        )
+        output = resp.get("output", "")
+        try:
+            json.loads(output)
+            return output
+        except Exception:
+            return json.dumps({"type": "text", "content": output}, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps(
+            {"type": "text", "content": f"❌ 调用智能体失败: {e}"},
+            ensure_ascii=False,
+        )
 
 if __name__ == "__main__":
     # 检查关键配置

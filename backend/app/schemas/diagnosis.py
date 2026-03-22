@@ -53,6 +53,8 @@ class DiagnosisResultBase(BaseModel):
     prevention_advice: str = Field(..., example="定期施用镁肥...")
     treatment_advice: str = Field(..., example="立即喷施硫酸镁叶面肥...")
     follow_up_plan: str = Field(..., example="7天后观察新叶生长情况并反馈效果。")
+    # 与 diagnoses 表 original_image_urls 对齐，便于病例/档案展示本次上传图
+    original_image_urls: List[str] = Field(default_factory=list, example=[])
 
 class DiagnosisResultCreate(DiagnosisResultBase):
     pass # LLM will provide these fields

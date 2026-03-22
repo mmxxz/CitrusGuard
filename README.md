@@ -66,10 +66,6 @@ graph TD
     class Database,FileStorage,MLModel data;
 ```
 
-*(建议：你可以使用 draw.io 或 Mermaid.js
-  制作一张简单的架构图，展示前端、后端API、AI
-  Agent核心、工具集、数据库之间的关系，这会非常加分！)*
-
 ### 核心功能
 
 *   **📸 多模态诊断**：用户可上传柑橘叶片或果实的图片。Agent 能够调用多模态大模型（`moonshot-v1-8k-vision-preview`），将本地图片转为 data URL 进行分析，直接从图像中提取病斑、虫害等关键视觉特征。

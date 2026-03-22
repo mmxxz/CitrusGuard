@@ -12,6 +12,8 @@ export interface RiskAlert {
   reason: string;
   type: 'disease' | 'pest' | 'deficiency';
   // 兼容后端新版字段（可选）
+  /** 病害/虫害中文名，用于问诊跳转文案等 */
+  risk_item?: string;
   title?: string;
   severity?: 'high' | 'medium' | 'low';
   basis?: string[] | string;

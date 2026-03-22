@@ -10,8 +10,9 @@ passlib[bcrypt]
 python-jose[cryptography]
 python-multipart
 
-# Pin LangChain stack to versions compatible with Pydantic v2
-langchain>=0.3.7
+# LangChain 0.3.x 兼容栈（<1.0.0 避免新架构删除 AgentExecutor 等旧 API）
+# 代码已通过 try/except 兼容 1.x，但安装时优先用 0.3.x 以减少风险
+langchain>=0.3.7,<1.0.0
 langchain-openai>=0.2.7
 langchain-community>=0.3.7
 langgraph>=0.2.39

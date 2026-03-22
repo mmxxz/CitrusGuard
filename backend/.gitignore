@@ -1,1 +1,15 @@
-\n# Uploaded files\n/uploads/
+# Runtime & secrets
+uploads/
+artifacts/
+# 仅忽略本地 Sentence-Transformer 权重；保留 models/convnext/best.pt
+models/paraphrase-multilingual-MiniLM-L12-v2/
+.env
+.env.*
+*.env
+app/agent_v2/.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/

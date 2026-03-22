@@ -7,6 +7,7 @@ import { useAppStore } from '../lib/store';
 import { getCachedOrchardAlerts, getCachedOrchardHealth } from '../services/cache';
 import { RiskAlert } from '../types';
 import Spinner from '../components/Spinner';
+import { riskBarColorClass, FUZZY_RISK_MEDIUM_MIN, FUZZY_RISK_HIGH_MIN } from '../lib/riskDisplay';
 
 const Alerts = () => {
   const navigate = useNavigate();
@@ -68,6 +69,9 @@ const Alerts = () => {
             <div className="flex items-center gap-2 mb-3">
               <BarChart2 className="w-6 h-6 text-orange-500" />
               <h2 className="font-semibold text-gray-800 text-base">当前主要风险分布</h2>
+              <p className="text-xs text-gray-500 mt-0.5">
+                分值 0–100，分级与模糊推理引擎一致（≥{FUZZY_RISK_MEDIUM_MIN} 中风险、≥{FUZZY_RISK_HIGH_MIN} 高风险）
+              </p>
             </div>
             <div className="space-y-2">
               {Object.entries(riskDistribution)
@@ -79,11 +83,8 @@ const Alerts = () => {
                     <div className="flex items-center gap-2">
                       <div className="w-24 bg-gray-200 rounded-full h-2.5">
                         <div 
-                          className={`h-2.5 rounded-full ${
-                            risk >= 70 ? 'bg-red-500' : 
-                            risk >= 40 ? 'bg-yellow-500' : 'bg-green-500'
-                          }`}
-                          style={{ width: `${Math.min(risk, 100)}%` }}
+                          className={`h-2.5 rounded-full ${riskBarColorClass(risk)}`}
+                          style={{ width: `${Math.min(Math.max(risk, 0), 100)}%` }}
                         />
                       </div>
                       <span className="text-sm font-medium text-gray-600 w-12 text-right">
@@ -128,10 +129,12 @@ const Alerts = () => {
                   忽略
                 </button>
                 <button 
+                  type="button"
+                  title="打开智能问诊并自动发送一条说明，便于结合田间情况进一步核实该预警"
                   onClick={() => navigate('/diagnosis', { state: { alertToConfirm: alert } })}
                   className="flex-1 bg-green-600 text-white rounded-xl py-2.5 text-sm font-medium active:bg-green-700"
                 >
-                  前往确认
+                  问诊核实
                 </button>
               </div>
             </div>

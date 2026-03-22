@@ -4,9 +4,16 @@ from sqlalchemy.orm import Session
 
 from app import schemas, crud, models
 from app.api.v1.orchards import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.services.agent_v2_service import agent_v2_service
+from app.services.langgraph_service import langgraph_service
 from app.services.websocket_service import manager
+
+
+def _diagnosis_agent_backend() -> str:
+    """来自环境变量 DIAGNOSIS_AGENT_BACKEND：agent_v2 | langgraph"""
+    return (settings.DIAGNOSIS_AGENT_BACKEND or "agent_v2").strip().lower()
 
 router = APIRouter(
     prefix="/orchards/{orchard_id}/diagnosis",
@@ -40,13 +47,22 @@ async def start_diagnosis(
     # 2. Store the user's first message
     crud.diagnosis.create_message(db, session_id=db_session.id, message=schemas.MessageBase(sender="user", content_text=initial_data.initial_description))
 
-    # 3. Now, start the background agent task with the created session_id (agent-v2)
-    await agent_v2_service.start_new_session(
-        session_id=session_id,
-        orchard_id=orchard_id,
-        initial_query=initial_data.initial_description,
-        image_urls=initial_data.image_urls
-    )
+    # 3. 后台诊断任务：默认 agent_v2；设置 DIAGNOSIS_AGENT_BACKEND=langgraph 走 app/agents 状态图
+    q = initial_data.initial_description or ""
+    if _diagnosis_agent_backend() == "langgraph":
+        await langgraph_service.start_new_session(
+            session_id=session_id,
+            orchard_id=orchard_id,
+            initial_query=q,
+            image_urls=initial_data.image_urls,
+        )
+    else:
+        await agent_v2_service.start_new_session(
+            session_id=session_id,
+            orchard_id=orchard_id,
+            initial_query=initial_data.initial_description,
+            image_urls=initial_data.image_urls,
+        )
     
     return schemas.DiagnosisSessionStartResponse(session_id=session_id)
 
@@ -58,8 +74,23 @@ async def continue_diagnosis(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    crud.diagnosis.create_message(db, session_id=uuid.UUID(session_id), message=schemas.MessageBase(sender="user", content_text=user_input.user_input))
-    await agent_v2_service.continue_session(session_id, user_input.user_input)
+    crud.diagnosis.create_message(
+        db,
+        session_id=uuid.UUID(session_id),
+        message=schemas.MessageBase(
+            sender="user",
+            content_text=user_input.user_input,
+            content_image_urls=user_input.image_urls,
+        ),
+    )
+    if _diagnosis_agent_backend() == "langgraph":
+        await langgraph_service.continue_session(session_id, user_input.user_input)
+    else:
+        await agent_v2_service.continue_session(
+            session_id,
+            user_input.user_input,
+            user_input.image_urls,
+        )
     return {"status": "received"}
 
 @router.get("/{session_id}/result", response_model=schemas.DiagnosisResult)

@@ -16,10 +16,26 @@ __pycache__/
 .env.*
 *.env
 
-# Data / weights / uploads
+# 嵌入模型目录（体积可达数 GB，勿提交；默认从 Hugging Face 拉取）
 backend/models/paraphrase-multilingual-MiniLM-L12-v2/
+
+# CitrusHVT 权重在 backend/models/convnext/best.pt（约 325MB，须用 Git LFS 上传 GitHub）
+# 训练 notebook：backend/training/convnext/*.ipynb
+
 backend/uploads/
+backend/artifacts/
 uploads/
+
+# Jupyter 缓存
+**/.ipynb_checkpoints/
+
+# 本地草稿 / 工具缓存（勿提交）
+.claude/
+.langgraph_api/
+修改/
+
+# 根目录误装的 node（前端以 project/ 为准）
+/node_modules/
 
 # Build caches / tooling
 .cache/
@@ -27,6 +43,7 @@ uploads/
 project/.vite/
 coverage/
 .pytest_cache/
+project/dist/
 
 # OS / editor
 .DS_Store

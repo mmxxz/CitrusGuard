@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     # DeepSeek API Key
     DEEPSEEK_API_KEY: str = "your_deepseek_api_key_here"
     
+    # 诊断智能体后端：agent_v2（默认）| langgraph（backend/app/agents 状态图）
+    DIAGNOSIS_AGENT_BACKEND: str = "agent_v2"
+
+    # 向量嵌入：Hugging Face 模型 ID，或本机目录绝对/相对路径（见 .env 示例）
+    EMBEDDING_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
     # OpenWeatherMap API Key
     OPENWEATHER_API_KEY: str = "your_openweather_api_key_here"
     

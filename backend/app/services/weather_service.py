@@ -6,6 +6,65 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# OpenWeather 对中文城市名 q=成都,CN 可能解析到错误地点，导致温度异常。
+# 对常见城市优先使用英文地名查询（units=metric 仍为摄氏度）。
+_CN_CITY_CORE_TO_EN: Dict[str, str] = {
+    "北京": "Beijing",
+    "上海": "Shanghai",
+    "天津": "Tianjin",
+    "重庆": "Chongqing",
+    "成都": "Chengdu",
+    "广州": "Guangzhou",
+    "深圳": "Shenzhen",
+    "杭州": "Hangzhou",
+    "武汉": "Wuhan",
+    "西安": "Xi'an",
+    "南京": "Nanjing",
+    "苏州": "Suzhou",
+    "郑州": "Zhengzhou",
+    "长沙": "Changsha",
+    "沈阳": "Shenyang",
+    "青岛": "Qingdao",
+    "大连": "Dalian",
+    "厦门": "Xiamen",
+    "福州": "Fuzhou",
+    "济南": "Jinan",
+    "合肥": "Hefei",
+    "南昌": "Nanchang",
+    "昆明": "Kunming",
+    "贵阳": "Guiyang",
+    "南宁": "Nanning",
+    "石家庄": "Shijiazhuang",
+    "太原": "Taiyuan",
+    "长春": "Changchun",
+    "哈尔滨": "Harbin",
+    "兰州": "Lanzhou",
+    "乌鲁木齐": "Urumqi",
+    "拉萨": "Lhasa",
+    "海口": "Haikou",
+    "银川": "Yinchuan",
+    "西宁": "Xining",
+    "呼和浩特": "Hohhot",
+    "绵阳": "Mianyang",
+    "乐山": "Leshan",
+    "眉山": "Meishan",
+    "德阳": "Deyang",
+    "自贡": "Zigong",
+    "泸州": "Luzhou",
+    "南充": "Nanchong",
+    "宜宾": "Yibin",
+    "达州": "Dazhou",
+    "攀枝花": "Panzhihua",
+}
+
+
+def _china_mainland_bbox(lat: Optional[float], lon: Optional[float]) -> bool:
+    """粗略判断坐标是否在中国大陆范围（用于发现错误地理解析）。"""
+    if lat is None or lon is None:
+        return True
+    return 18.0 <= lat <= 54.0 and 73.0 <= lon <= 135.0
+
+
 class WeatherService:
     """天气服务 - 使用OpenWeatherMap API获取真实天气数据"""
     
@@ -50,35 +109,83 @@ class WeatherService:
             logger.error(f"Error fetching weather data: {e}")
             return None
     
+    def _openweather_q_for_city(self, city_name: str, country_code: str) -> Tuple[str, str]:
+        """
+        返回 (q 参数, 说明)。
+        有映射时用英文城市名，减少 OpenWeather 对中文 q 的歧义匹配。
+        """
+        raw = (city_name or "").strip()
+        core = raw[:-1] if raw.endswith("市") else raw
+        en = _CN_CITY_CORE_TO_EN.get(core)
+        if en:
+            return f"{en},{country_code}", f"alias:{core}->{en}"
+        return f"{raw},{country_code}", "raw"
+
     async def get_weather_by_city(self, city_name: str, country_code: str = "CN") -> Optional[Dict[str, Any]]:
         """根据城市名称获取天气数据"""
         if not self.api_key:
             logger.warning("OpenWeatherMap API key not configured")
             return None
-            
-        try:
+
+        q_primary, q_note = self._openweather_q_for_city(city_name, country_code)
+        logger.info("OpenWeather city query: input=%r q=%r (%s)", city_name, q_primary, q_note)
+
+        async def _fetch(q: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # 获取当前天气
                 current_url = f"{self.base_url}/weather"
                 params = {
-                    "q": f"{city_name},{country_code}",
+                    "q": q,
                     "appid": self.api_key,
                     "units": "metric",
-                    "lang": "zh_cn"
+                    "lang": "zh_cn",
                 }
-                
-                response = await client.get(current_url, params=params)
-                response.raise_for_status()
-                current_data = response.json()
-                
-                # 获取5天预报
+                r1 = await client.get(current_url, params=params)
+                r1.raise_for_status()
+                current_data = r1.json()
                 forecast_url = f"{self.base_url}/forecast"
-                response = await client.get(forecast_url, params=params)
-                response.raise_for_status()
-                forecast_data = response.json()
-                
-                return self._parse_weather_data(current_data, forecast_data)
-                
+                r2 = await client.get(forecast_url, params=params)
+                r2.raise_for_status()
+                forecast_data = r2.json()
+                return current_data, forecast_data
+
+        try:
+            current_data, forecast_data = await _fetch(q_primary)
+            coord = current_data.get("coord") or {}
+            lat, lon = coord.get("lat"), coord.get("lon")
+            loc_name = current_data.get("name", "")
+            raw_in = (city_name or "").strip()
+            core_in = raw_in[:-1] if raw_in.endswith("市") else raw_in
+            en_in = _CN_CITY_CORE_TO_EN.get(core_in)
+            # 中国大陆果园但解析坐标跑出 bbox：用英文城市名再拉一次（仅当存在映射且当前 q 不是英文名）
+            if (
+                country_code.upper() == "CN"
+                and en_in
+                and not _china_mainland_bbox(lat, lon)
+                and q_primary != f"{en_in},{country_code}"
+            ):
+                q_retry = f"{en_in},{country_code}"
+                logger.warning(
+                    "OpenWeather 坐标疑似非中国大陆 (lat=%s lon=%s name=%r input=%r)，重试 q=%r",
+                    lat,
+                    lon,
+                    loc_name,
+                    city_name,
+                    q_retry,
+                )
+                current_data, forecast_data = await _fetch(q_retry)
+
+            parsed = self._parse_weather_data(current_data, forecast_data)
+            loc = parsed.get("location") or {}
+            logger.info(
+                "OpenWeather resolved: name=%r country=%r lat=%s lon=%s temp=%s",
+                loc.get("name"),
+                loc.get("country"),
+                loc.get("lat"),
+                loc.get("lon"),
+                (parsed.get("current") or {}).get("temperature"),
+            )
+            return parsed
+
         except httpx.HTTPError as e:
             logger.error(f"HTTP error fetching weather data for {city_name}: {e}")
             return None

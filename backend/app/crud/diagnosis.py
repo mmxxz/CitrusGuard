@@ -38,6 +38,27 @@ def create_diagnosis_result(db: Session, session_id: uuid.UUID, result_data: sch
     db.refresh(db_diagnosis)
     return db_diagnosis
 
+
+def upsert_diagnosis_result(db: Session, session_id: uuid.UUID, result_data: schemas.DiagnosisResultCreate):
+    """
+    若该会话已有 diagnoses 行则更新（多轮后 agent 才输出正式报告时同步档案），否则新建。
+    """
+    row = get_diagnosis_result_by_session(db, session_id)
+    if row is None:
+        return create_diagnosis_result(db, session_id, result_data)
+    payload = result_data.model_dump()
+    for key, val in payload.items():
+        if hasattr(row, key):
+            setattr(row, key, val)
+    db_session = get_diagnosis_session(db, session_id)
+    if db_session:
+        db_session.status = "completed"
+        db.add(db_session)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
 def get_diagnosis_result_by_session(db: Session, session_id: uuid.UUID):
     return db.query(models.Diagnosis).filter(models.Diagnosis.session_id == session_id).first()
 

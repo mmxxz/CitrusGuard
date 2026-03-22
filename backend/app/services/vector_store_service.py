@@ -29,13 +29,25 @@ class MockVectorStore:
         print(f"Mock: Searching for '{query}', returning {len(mock_results)} results")
         return mock_results[:k]
 
+    def as_retriever(self, search_kwargs: Optional[dict] = None, **kwargs):
+        """与 PGVector 对齐，供 rag_qa_node：as_retriever().get_relevant_documents()"""
+        sk = search_kwargs or kwargs.get("search_kwargs") or {}
+        k = int(sk.get("k", 5))
+        parent = self
+
+        class _MockRetriever:
+            def get_relevant_documents(self, query: str) -> List[Document]:
+                return parent.similarity_search(query, k=k)
+
+        return _MockRetriever()
+
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
         print("Initializing embeddings model...")
         try:
             _embeddings = HuggingFaceEmbeddings(
-                model_name="/Users/letaotao/Desktop/CitrusGuard/backend/models/paraphrase-multilingual-MiniLM-L12-v2",
+                model_name=settings.EMBEDDING_MODEL_NAME,
                 model_kwargs={"device": "cpu"},
                 encode_kwargs={"normalize_embeddings": True}
             )

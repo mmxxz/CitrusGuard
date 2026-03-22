@@ -23,7 +23,7 @@ const SmartOrchard = ({ healthScore, riskAlerts, weatherCondition }: SmartOrchar
           <circle cx="65" cy="65" r="20" />
         </svg>
       </div>
-      {Array.isArray(riskAlerts) && riskAlerts.filter(alert => alert.level === 'high').map((alert, index) => (
+      {Array.isArray(riskAlerts) && riskAlerts.filter(alert => alert.severity === 'high' || alert.level === 'high').map((alert, index) => (
         <div
           key={alert.id}
           className="absolute bottom-20 left-1/2 w-3 h-3 bg-red-500 rounded-full animate-pulse cursor-pointer"
